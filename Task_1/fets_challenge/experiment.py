@@ -272,6 +272,7 @@ def run_challenge_experiment(aggregation_function,
     collaborator_names = construct_fedsim_csv(brats_training_data_parent_dir,
                                               institution_split_csv_filename,
                                               0.8,
+                                              problem_type='classification',
                                               gandlf_csv_path)
 
     aggregation_wrapper = CustomAggregationWrapper(aggregation_function)

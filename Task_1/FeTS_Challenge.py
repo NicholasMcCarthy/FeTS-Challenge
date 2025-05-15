@@ -490,6 +490,129 @@ def FedAvgM_Selection(local_tensors,
 
                 return new_tensor_weight
 
+"""
+Uncertainty-Aware Aggregation Methods for Federated Learning
+
+This script implements several aggregator-side uncertainty estimation strategies
+for weighting collaborator updates during federated learning. 
+
+These methods assume no explicit uncertainty is reported by collaborators.
+
+Author: Nicholas McCarthy
+"""
+
+def weighted_average_aggregation(local_tensors, *_):
+    """Standard weighted average of tensors."""
+    return np.average([t.tensor for t in local_tensors],
+                      weights=[t.weight for t in local_tensors], axis=0)
+
+def normalize_weights(weights):
+    """Ensure weights sum to 1 to avoid collapse or over-weighting."""
+    weights = np.array(weights)
+    total = np.sum(weights)
+    if total == 0:
+        return np.ones_like(weights) / len(weights)
+    return weights / total
+
+# === Safeguard: Cap Penalty to Avoid Over-Penalizing Divergent Updates ===
+def cap_penalty(weights, min_ratio=0.1):
+    """
+    Prevent collapse by capping how low any collaborator's weight can go.
+
+    Args:
+        weights (array-like): Raw weights before normalization.
+        min_ratio (float): Minimum allowed ratio of any weight relative to the max.
+    """
+    weights = np.array(weights)
+    max_weight = np.max(weights)
+    min_allowed = max_weight * min_ratio
+    capped = np.clip(weights, min_allowed, None)
+    return normalize_weights(capped)
+
+def client_metric_weighted_aggregation(metric_name):
+    """
+    Returns a weighting function using client-reported metric (e.g., val_loss, disagreement).
+    Lower metric value = higher weight (i.e., inverse weighting).
+    """
+    def aggregator(local_tensors, tensor_db, tensor_name, fl_round,
+                   collaborators_chosen_each_round, collaborator_times_per_round):
+        tensors, weights = [], []
+        for t in local_tensors:
+            value = tensor_db.retrieve(tensor_name=metric_name, origin=t.col_name,
+                                       fl_round=fl_round, tags=('metric',))
+            value = float(value) if value is not None else 1.0
+            weight = t.weight / (value + 1e-6)
+            tensors.append(t.tensor)
+            weights.append(weight)
+        weights = cap_penalty(weights)
+        return np.average(tensors, weights=weights, axis=0)
+    return aggregator
+
+def delta_magnitude_weighted_aggregation(local_tensors, tensor_db, tensor_name, fl_round,
+                                         collaborators_chosen_each_round, collaborator_times_per_round):
+    """Use L2 norm of model update delta as inverse proxy for uncertainty."""
+    prev_tensor_df = tensor_db.search(tensor_name=tensor_name, fl_round=fl_round,
+                                      tags=('model',), origin='aggregator')
+    if prev_tensor_df.empty:
+        return weighted_average_aggregation(local_tensors)
+
+    prev_tensor = prev_tensor_df.nparray.iloc[0]
+    tensors, weights = [], []
+
+    for t in local_tensors:
+        delta = t.tensor - prev_tensor
+        uncertainty = np.linalg.norm(delta) + 1e-6
+        adjusted_weight = t.weight / uncertainty
+        tensors.append(t.tensor)
+        weights.append(adjusted_weight)
+
+    weights = cap_penalty(weights)
+    return np.average(tensors, weights=weights, axis=0)
+
+def cosine_similarity_weighted_aggregation(local_tensors, tensor_db, tensor_name, fl_round,
+                                           collaborators_chosen_each_round, collaborator_times_per_round):
+    """Use directional similarity of updates with previous global model as trust proxy."""
+    prev_tensor_df = tensor_db.search(tensor_name=tensor_name, fl_round=fl_round,
+                                      tags=('model',), origin='aggregator')
+    if prev_tensor_df.empty:
+        return weighted_average_aggregation(local_tensors)
+
+    prev_tensor = prev_tensor_df.nparray.iloc[0]
+    tensors, weights = [], []
+
+    for t in local_tensors:
+        delta = t.tensor - prev_tensor
+        sim = np.dot(delta.flatten(), prev_tensor.flatten()) / (
+            np.linalg.norm(delta.flatten()) * np.linalg.norm(prev_tensor.flatten()) + 1e-6)
+        sim_weight = (sim + 1) / 2
+        adjusted_weight = t.weight * sim_weight
+        tensors.append(t.tensor)
+        weights.append(adjusted_weight)
+
+    weights = cap_penalty(weights)
+    return np.average(tensors, weights=weights, axis=0)
+
+def variance_based_weighting_aggregation(local_tensors, tensor_db, tensor_name, fl_round,
+                                         collaborators_chosen_each_round, collaborator_times_per_round):
+    """Penalize updates that deviate from the mean update (encourages consensus).    
+    """
+    updates = [t.tensor for t in local_tensors]
+    weights = [t.weight for t in local_tensors]
+    mean_update = np.average(updates, weights=weights, axis=0)
+
+    tensors, adjusted_weights = [], []
+    for t in local_tensors:
+        deviation = np.linalg.norm(t.tensor - mean_update) + 1e-6
+        weight = t.weight / deviation
+        tensors.append(t.tensor)
+        adjusted_weights.append(weight)
+
+    adjusted_weights = cap_penalty(adjusted_weights)
+    return np.average(tensors, weights=adjusted_weights, axis=0)
+
+validation_loss_weighted_aggregation = client_metric_weighted_aggregation('val_loss')
+ensemble_disagreement_weighted_aggregation = client_metric_weighted_aggregation('ensemble_disagreement')
+dropout_variance_weighted_aggregation = client_metric_weighted_aggregation('dropout_variance')
 
 # # Running the Experiment
 # 
@@ -509,7 +632,7 @@ def FedAvgM_Selection(local_tensors,
 
 
 # change any of these you wish to your custom functions. You may leave defaults if you wish.
-aggregation_function = weighted_average_aggregation
+aggregation_function = delta_magnitude_weighted_aggregation
 choose_training_collaborators = all_collaborators_train
 training_hyper_parameters_for_round = constant_hyper_parameters
 
